@@ -33,6 +33,7 @@ try {
         $FirewallRuleAdded = $true
     }
 
+	Write-Host "Проверка соединения с сервером WELCOME TO HELL" -ForegroundColor Red
     Write-Host "Проверка доступности ICMP..." -ForegroundColor Yellow
 
     # 5. ICMP Pre-check: Try to ping Google DNS to see if ICMP is blocked locally
