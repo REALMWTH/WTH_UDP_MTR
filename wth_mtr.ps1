@@ -1,25 +1,50 @@
-# 1. Auto-request administrator privileges
+ï»¿# 1. Auto-request administrator privileges
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
     exit
 }
 
-# 2. Silent check/install of Trippy utility
-if (-not (Get-Command trip -ErrorAction SilentlyContinue)) {
-    Write-Host "Ñêà÷èâàíèå óòèëèòû äëÿ äèàãíîñòèêè..." -ForegroundColor Yellow
-    winget install trippy --silent --accept-package-agreements --accept-source-agreements *> $null
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-    
-    if (Get-Command trip -ErrorAction SilentlyContinue) {
-        Write-Host "[ÓÑÏÅÕ] Óòèëèòà Trippy óñïåøíî óñòàíîâëåíà!" -ForegroundColor Green
-    } else {
-        Write-Host "[ÎØÈÁÊÀ] Óñòàíîâêà íå óäàëàñü. Ïðîâåðüòå èíòåðíåò." -ForegroundColor Red
-        Read-Host "Íàæìèòå Enter äëÿ âûõîäà..."
+# 2. Silent check/install of WinGet (if missing)
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Host "[!] WinGet Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½. Ð£ÑÑ‚Ð°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÑŽ..." -ForegroundColor Yellow
+    try {
+        $WinGetUrl = "https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+        $WinGetInstaller = Join-Path $env:TEMP "WinGet.msixbundle"
+        Invoke-WebRequest -Uri $WinGetUrl -OutFile $WinGetInstaller -UseBasicParsing
+        Add-AppxPackage -Path $WinGetInstaller -ErrorAction Stop
+        Remove-Item $WinGetInstaller -Force -ErrorAction SilentlyContinue
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "[OK] WinGet ÑƒÑÐ¿ÐµÑˆÐ½Ð¾ ÑƒÑÑ‚Ð°Ð½Ð¾Ð²Ð»ÐµÐ½!" -ForegroundColor Green
+        } else {
+            Write-Host "[ERR] WinGet Ð½Ðµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ ÑƒÑÑ‚Ð°Ð½Ð¾Ð²Ð¸Ñ‚ÑŒ. Ð£ÑÑ‚Ð°Ð½Ð¾Ð²Ð¸Ñ‚Ðµ Ð²Ñ€ÑƒÑ‡Ð½ÑƒÑŽ: https://aka.ms/getwinget" -ForegroundColor Red
+            Read-Host "ÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Enter Ð´Ð»Ñ Ð²Ñ‹Ñ…Ð¾Ð´Ð°..."
+            exit
+        }
+    } catch {
+        Write-Host "[ERR] ÐžÑˆÐ¸Ð±ÐºÐ° Ð¿Ñ€Ð¸ ÑƒÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐµ WinGet: $_" -ForegroundColor Red
+        Write-Host "Ð£ÑÑ‚Ð°Ð½Ð¾Ð²Ð¸Ñ‚Ðµ Ð²Ñ€ÑƒÑ‡Ð½ÑƒÑŽ: https://aka.ms/getwinget" -ForegroundColor Yellow
+        Read-Host "ÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Enter Ð´Ð»Ñ Ð²Ñ‹Ñ…Ð¾Ð´Ð°..."
         exit
     }
 }
 
-# 3. Track firewall modifications
+# 3. Silent check/install of Trippy utility
+if (-not (Get-Command trip -ErrorAction SilentlyContinue)) {
+    Write-Host "Ð£ÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ° ÑƒÑ‚Ð¸Ð»Ð¸Ñ‚Ñ‹ Trippy..." -ForegroundColor Yellow
+    winget install trippy --silent --accept-package-agreements --accept-source-agreements *> $null
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    
+    if (Get-Command trip -ErrorAction SilentlyContinue) {
+        Write-Host "[OK] Ð£Ñ‚Ð¸Ð»Ð¸Ñ‚Ð° Trippy ÑƒÑÐ¿ÐµÑˆÐ½Ð¾ ÑƒÑÑ‚Ð°Ð½Ð¾Ð²Ð»ÐµÐ½Ð°!" -ForegroundColor Green
+    } else {
+        Write-Host "[ERR] Ð£ÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ° Ð½Ðµ ÑƒÐ´Ð°Ð»Ð°ÑÑŒ. ÐŸÑ€Ð¾Ð²ÐµÑ€ÑŒÑ‚Ðµ Ð¸Ð½Ñ‚ÐµÑ€Ð½ÐµÑ‚." -ForegroundColor Red
+        Read-Host "ÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Enter Ð´Ð»Ñ Ð²Ñ‹Ñ…Ð¾Ð´Ð°..."
+        exit
+    }
+}
+
+# 4. Track firewall modifications
 $FirewallRuleAdded = $false
 
 # Force UTF-8 encoding
@@ -27,59 +52,59 @@ $FirewallRuleAdded = $false
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 try {
-    # 4. Configure Windows Defender Firewall
+    # 5. Configure Windows Defender Firewall
     if (-not (Get-NetFirewallRule -Name "ICMPv4_TRIPPY_ALLOW" -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -DisplayName "ICMPv4 Trippy Allow" -Name "ICMPv4_TRIPPY_ALLOW" -Protocol ICMPv4 -Action Allow *> $null
         $FirewallRuleAdded = $true
     }
 
-	Write-Host "Ïðîâåðêà ñîåäèíåíèÿ ñ ñåðâåðîì WELCOME TO HELL" -ForegroundColor Red
-    Write-Host "Ïðîâåðêà äîñòóïíîñòè ICMP..." -ForegroundColor Yellow
+	Write-Host "ÐŸÑ€Ð¾Ð²ÐµÑ€ÐºÐ° ÑÐ¾ÐµÐ´Ð¸Ð½ÐµÐ½Ð¸Ñ Ñ ÑÐµÑ€Ð²ÐµÑ€Ð¾Ð¼ WELCOME TO HELL" -ForegroundColor Red
+    Write-Host "ÐŸÑ€Ð¾Ð²ÐµÑ€ÐºÐ° Ð´Ð¾ÑÑ‚ÑƒÐ¿Ð½Ð¾ÑÑ‚Ð¸ ICMP..." -ForegroundColor Yellow
 
-    # 5. ICMP Pre-check: Try to ping Google DNS to see if ICMP is blocked locally
+    # 6. ICMP Pre-check: Try to ping Google DNS to see if ICMP is blocked locally
     # We use -Count 1 and -Quiet to get a fast boolean result
     $IcmpWorks = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet
     
     if (-not $IcmpWorks) {
-        Write-Host "`n[ÊÐÈÒÈ×ÅÑÊÀß ÎØÈÁÊÀ] ICMP òðàôèê çàáëîêèðîâàí!" -ForegroundColor Red
-        Write-Host "Äàæå ïîñëå íàñòðîéêè áðàíäìàóýðà ñèñòåìà íå ìîæåò îòïðàâèòü/ïîëó÷èòü ïàêåòû." -ForegroundColor Red
-        Write-Host "Âåðîÿòíî, âàø àíòèâèðóñ (Kaspersky, ESET, Avast è äð.) ïîëíîñòüþ áëîêèðóåò äèàãíîñòèêó." -ForegroundColor Yellow
-        Write-Host "Ïîæàëóéñòà, îòêëþ÷èòå çàùèòó íà âðåìÿ òåñòà è ïîïðîáóéòå ñíîâà." -ForegroundColor Cyan
+        Write-Host "`n[Ð’ÐÐ˜ÐœÐÐÐ˜Ð•] ICMP Ñ‚Ñ€Ð°Ñ„Ð¸Ðº Ð·Ð°Ð±Ð»Ð¾ÐºÐ¸Ñ€Ð¾Ð²Ð°Ð½!" -ForegroundColor Red
+        Write-Host "Ð¡ÐºÐ¾Ñ€ÐµÐµ Ð²ÑÐµÐ³Ð¾ Ð²Ð°Ñˆ Ð±Ñ€Ð°Ð½Ð´Ð¼Ð°ÑƒÑÑ€ Ð¸Ð»Ð¸ Ð°Ð½Ñ‚Ð¸Ð²Ð¸Ñ€ÑƒÑ Ð±Ð»Ð¾ÐºÐ¸Ñ€ÑƒÐµÑ‚ ICMP Ñ‚Ñ€Ð°Ñ„Ð¸Ðº." -ForegroundColor Red
+        Write-Host "Ð’Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð¾, Ð²Ð°Ñˆ Ð°Ð½Ñ‚Ð¸Ð²Ð¸Ñ€ÑƒÑ (Kaspersky, ESET, Avast Ð¸ Ð´Ñ€.) Ð±Ð»Ð¾ÐºÐ¸Ñ€ÑƒÐµÑ‚ ÑÑ‚Ð¾Ñ‚ Ð¿Ñ€Ð¾Ñ‚Ð¾ÐºÐ¾Ð»." -ForegroundColor Yellow
+        Write-Host "ÐŸÐ¾Ð¿Ñ€Ð¾Ð±ÑƒÐ¹Ñ‚Ðµ Ð¾Ñ‚ÐºÐ»ÑŽÑ‡Ð¸Ñ‚ÑŒ ÐµÐ³Ð¾ Ð½Ð° Ð²Ñ€ÐµÐ¼Ñ Ð¸ Ð·Ð°Ð¿ÑƒÑÑ‚Ð¸Ñ‚ÑŒ ÑÐ½Ð¾Ð²Ð°." -ForegroundColor Cyan
         
         # We don't need to manually delete the rule here, 'finally' block will do it
-        Read-Host "`nÍàæìèòå Enter äëÿ âûõîäà..."
+        Read-Host "`nÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Enter Ð´Ð»Ñ Ð²Ñ‹Ñ…Ð¾Ð´Ð°..."
         exit
     }
 
-    # 6. Settings and paths
+    # 7. Settings and paths
     $Target = "s1.scpsl.ru"
     $Timestamp = Get-Date -f 'HH-mm-ss'
     $DesktopPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "WTH_Report_$Timestamp.txt"
 
-    Write-Host "ICMP ðàáîòàåò. Ñáîð äàííûõ çàïóùåí..." -ForegroundColor Green
+    Write-Host "ICMP Ñ€Ð°Ð±Ð¾Ñ‚Ð°ÐµÑ‚. Ð˜Ð´Ñ‘Ñ‚ ÑÐ±Ð¾Ñ€ Ð´Ð°Ð½Ð½Ñ‹Ñ…..." -ForegroundColor Green
 
-    # 7. Fetch Public IP
+    # 8. Fetch Public IP
     try {
-        $UserIP = (curl.exe -s https://2ip.ru).Trim()
-        "Ïóáëè÷íûé IP èãðîêà: $UserIP`n" | Out-File -FilePath $DesktopPath -Encoding utf8
+        $UserIP = (curl.exe -s https://2ip.io).Trim()
+        "ÐŸÑƒÐ±Ð»Ð¸Ñ‡Ð½Ñ‹Ð¹ IP Ð°Ð´Ñ€ÐµÑ: $UserIP`n" | Out-File -FilePath $DesktopPath -Encoding utf8
     } catch {
-        "Ïóáëè÷íûé IP èãðîêà: Íå óäàëîñü îïðåäåëèòü`n" | Out-File -FilePath $DesktopPath -Encoding utf8
+        "ÐŸÑƒÐ±Ð»Ð¸Ñ‡Ð½Ñ‹Ð¹ IP Ð°Ð´Ñ€ÐµÑ: ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»Ð¸Ñ‚ÑŒ`n" | Out-File -FilePath $DesktopPath -Encoding utf8
     }
 
-    # 8. Execute Trippy
+    # 9. Execute Trippy
     & trip $Target --udp --multipath-strategy paris --source-port 5000 --target-port 7788 -m pretty -i 1s -T 2s -a both | Out-File -FilePath $DesktopPath -Encoding utf8 -Append
 
     if ($LASTEXITCODE -eq 0 -and (Test-Path $DesktopPath)) {
-        Write-Host "`n[ÓÑÏÅÕ] Îò÷åò ñîõðàíåí íà Ðàáî÷èé ñòîë: WTH_Report_$Timestamp.txt" -ForegroundColor Green
+        Write-Host "`n[OK] ÐžÑ‚Ñ‡Ñ‘Ñ‚ ÑÐ¾Ñ…Ñ€Ð°Ð½Ñ‘Ð½ Ð½Ð° Ñ€Ð°Ð±Ð¾Ñ‡Ð¸Ð¹ ÑÑ‚Ð¾Ð»: WTH_Report_$Timestamp.txt" -ForegroundColor Green
     } else {
-        Write-Host "`n[ÎØÈÁÊÀ] Òåñò çàâåðøèëñÿ íåóäà÷íî." -ForegroundColor Red
+        Write-Host "`n[ERR] Ð§Ñ‚Ð¾-Ñ‚Ð¾ Ð¿Ð¾ÑˆÐ»Ð¾ Ð½Ðµ Ñ‚Ð°Ðº." -ForegroundColor Red
     }
 
-    Write-Host "`nÍàæìèòå Enter, ÷òîáû çàêðûòü îêíî..." -ForegroundColor Gray
+    Write-Host "`nÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Enter, Ñ‡Ñ‚Ð¾Ð±Ñ‹ Ð·Ð°ÐºÑ€Ñ‹Ñ‚ÑŒ Ð¾ÐºÐ½Ð¾..." -ForegroundColor Gray
     Read-Host
 }
 finally {
-    # 9. Cleanup: Remove the temporary firewall rule regardless of success or failure
+    # 10. Cleanup: Remove the temporary firewall rule regardless of success or failure
     if ($FirewallRuleAdded) {
         Remove-NetFirewallRule -Name "ICMPv4_TRIPPY_ALLOW" -ErrorAction SilentlyContinue *> $null
     }
