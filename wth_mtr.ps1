@@ -11,7 +11,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 # 2. Settings and parameters
 $Target = "s1.scpsl.ru"
 $TargetPort = 7780
-$MtrCycles = 100
+$MtrCycles = 40
 $Timestamp = Get-Date -f 'yyyy-MM-dd_HH-mm-ss'
 $DesktopPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "WTH_Report_$Timestamp.txt"
 
@@ -50,9 +50,7 @@ try {
     if ($UserIP) {
         $PublicIpText = "Публичный IP адрес: $UserIP"
     }
-} catch {
-    # ignore
-}
+} catch {}
 
 Write-Host "[*] $PublicIpText" -ForegroundColor Gray
 Write-Host "[*] Дата и время: $DateStr" -ForegroundColor Gray
@@ -76,7 +74,7 @@ function Get-FastHostName([string]$ip) {
     }
     try {
         $task = [System.Net.Dns]::GetHostEntryAsync($ip)
-        if ($task.Wait(350)) {
+        if ($task.Wait(300)) {
             return $task.Result.HostName
         }
     } catch {}
@@ -84,16 +82,17 @@ function Get-FastHostName([string]$ip) {
 }
 
 # =========================================================================
-# UDP MTR ТРАССИРОВКА МАРШРУТА (100 ЦИКЛОВ)
+# ОПРЕДЕЛЕНИЕ МАРШРУТА К СЕРВЕРУ
 # =========================================================================
 Write-Host "[*] Определение маршрута к серверу (трассировка хопов)..." -ForegroundColor Cyan
 
 $ping = New-Object System.Net.NetworkInformation.Ping
 $discoveredHops = [System.Collections.Generic.List[PSCustomObject]]::new()
+$payloadBytes = [byte[]]@(1,2,3)
 
 for ($ttl = 1; $ttl -le 25; $ttl++) {
     $opt = New-Object System.Net.NetworkInformation.PingOptions($ttl, $true)
-    $reply = $ping.Send($TargetIp, 800, [byte[]]@(1,2,3), $opt)
+    $reply = $ping.Send($TargetIp, 400, $payloadBytes, $opt)
     if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::TtlExpired) {
         $ipStr = $reply.Address.ToString()
         $discoveredHops.Add([PSCustomObject]@{ Hop = $ttl; Ip = $ipStr; Host = (Get-FastHostName $ipStr); IsTarget = $false })
@@ -106,9 +105,15 @@ for ($ttl = 1; $ttl -le 25; $ttl++) {
     }
 }
 
-# Ensure the destination target is present as final hop
-if ($discoveredHops.Count -gt 0 -and -not $discoveredHops[$discoveredHops.Count - 1].IsTarget) {
-    $discoveredHops.Add([PSCustomObject]@{ Hop = ($discoveredHops.Count + 1); Ip = $TargetIp; Host = "${Target}:${TargetPort} [Game Port]"; IsTarget = $true })
+# Удаляем хвостовые пустые хопы (???), так как сервер защищен и не отвечает на ICMP Echo
+while ($discoveredHops.Count -gt 0 -and $discoveredHops[$discoveredHops.Count - 1].Ip -eq "???") {
+    $discoveredHops.RemoveAt($discoveredHops.Count - 1)
+}
+
+# Добавляем игровой порт сразу следующим хопом после последнего ответившего узла
+if ($discoveredHops.Count -eq 0 -or -not $discoveredHops[$discoveredHops.Count - 1].IsTarget) {
+    $nextHopNum = if ($discoveredHops.Count -gt 0) { $discoveredHops[$discoveredHops.Count - 1].Hop + 1 } else { 1 }
+    $discoveredHops.Add([PSCustomObject]@{ Hop = $nextHopNum; Ip = $TargetIp; Host = "${Target}:${TargetPort} [Game Port]"; IsTarget = $true })
 }
 
 $hopStats = @{}
@@ -124,23 +129,47 @@ foreach ($h in $discoveredHops) {
     }
 }
 
-Write-Host "[*] Запуск MTR замеров маршрута ($MtrCycles циклов по маршруту и игровому порту)..." -ForegroundColor Cyan
+Write-Host "[*] Маршрут определен ($($discoveredHops.Count) хопов)." -ForegroundColor Green
+Write-Host "[*] Запуск точных MTR замеров ($MtrCycles циклов по маршруту и игровому порту)..." -ForegroundColor Cyan
 
-$udp = [System.Net.Sockets.UdpClient]::new()
-$udp.Client.ReceiveTimeout = 1000
+# Подготовка сокета и полезной нагрузки
 $pingPayload = [System.Text.Encoding]::ASCII.GetBytes("WTH_PING_DIAGNOSTIC_DATA")
+$udp = [System.Net.Sockets.UdpClient]::new()
+$udp.Client.ReceiveTimeout = 800
+try {
+    $udp.Connect($TargetIp, $TargetPort)
+} catch {}
 
+# Холостой прогрев UDP-сокета и JIT-компиляции (устраняет ложный скачок Wrst ~50 мс на первом пакете)
+try {
+    $null = $udp.Send($pingPayload, $pingPayload.Length)
+    $warmupEp = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    $null = $udp.Receive([ref]$warmupEp)
+} catch {}
+
+$ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+$sw = New-Object System.Diagnostics.Stopwatch
+
+# =========================================================================
+# ЦИКЛ MTR ЗАМЕРОВ
+# =========================================================================
 for ($c = 1; $c -le $MtrCycles; $c++) {
-    Write-Host -NoNewline ("`r  [*] Прогресс MTR: {0}%" -f $c, $MtrCycles)
+    $pct = [Math]::Round(($c / $MtrCycles) * 100)
+    Write-Host -NoNewline ("`r  [*] Прогресс MTR: {0}% ({1}/{2})" -f $pct, $c, $MtrCycles)
+    
     foreach ($h in $discoveredHops) {
         $st = $hopStats[$h.Hop]
         $st.Sent++
+        
         if ($st.IsTarget) {
-            # Destination hop: Probe via custom UDP packet directly to game port 7780
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            # Очистка буфера от запоздавших пакетов прошлых циклов
+            while ($udp.Available -gt 0) {
+                try { $null = $udp.Receive([ref]$ep) } catch { break }
+            }
+            
+            $sw.Restart()
             try {
-                $null = $udp.Send($pingPayload, $pingPayload.Length, $TargetIp, $TargetPort)
-                $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $null = $udp.Send($pingPayload, $pingPayload.Length)
                 $resp = $udp.Receive([ref]$ep)
                 $sw.Stop()
                 if ($resp.Length -ge 8 -and [System.Text.Encoding]::ASCII.GetString($resp[0..7]) -eq "WTH_PING") {
@@ -151,11 +180,14 @@ for ($c = 1; $c -le $MtrCycles; $c++) {
                 $sw.Stop()
             }
         } else {
-            # Intermediate hop: Probe via TTL targeting the destination
             $opt = New-Object System.Net.NetworkInformation.PingOptions($h.Hop, $true)
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $reply = $ping.Send($TargetIp, 800, [byte[]]@(1,2,3), $opt)
+            # Для скрытых узлов (???) короткий таймаут 120 мс, для живых узлов 400 мс
+            $timeout = if ($st.IP -eq "???") { 120 } else { 400 }
+            
+            $sw.Restart()
+            $reply = $ping.Send($TargetIp, $timeout, $payloadBytes, $opt)
             $sw.Stop()
+            
             if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::TtlExpired -or $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
                 $st.Recv++
                 $st.Rtts.Add([Math]::Round($sw.Elapsed.TotalMilliseconds, 1))
@@ -166,12 +198,15 @@ for ($c = 1; $c -le $MtrCycles; $c++) {
             }
         }
     }
-    Start-Sleep -Milliseconds 40
+    Start-Sleep -Milliseconds 25
 }
+
 $udp.Close()
 Write-Host "`r  [+] MTR замеры из $MtrCycles пакетов успешно завершены!                    " -ForegroundColor Green
 
-# Format and write MTR table
+# =========================================================================
+# ВЫВОД И ФОРМАТИРОВАНИЕ ТАБЛИЦЫ РЕЗУЛЬТАТОВ
+# =========================================================================
 $tableHeader = @(
     "",
     "==================== UDP ROUTE MTR TRACE (PORT $TargetPort) ====================",
@@ -231,7 +266,6 @@ $VerdictLines = [System.Collections.Generic.List[string]]::new()
 $VerdictLines.Add("")
 $VerdictLines.Add("==================== ЗАКЛЮЧЕНИЕ ПО КАЧЕСТВУ СВЯЗИ ====================")
 
-# Check target server hop
 $targetHop = $null
 foreach ($h in $discoveredHops) {
     if ($hopStats[$h.Hop].IsTarget) {
@@ -254,12 +288,11 @@ if ($targetHop) {
     }
 }
 
-# Check hop 1 (home router/Wi-Fi)
 $hop1 = $hopStats[1]
 if ($hop1 -and $hop1.Rtts.Count -gt 0) {
     $hop1Avg = ($hop1.Rtts | Measure-Object -Average).Average
     if ($hop1Avg -gt 10.0) {
-        $vWifi = "[!] Высокая задержка до домашнего роутера ({0} ms). Если используется Wi-Fi, рекомендуется подключить кабель Ethernet." -f $hop1Avg
+        $vWifi = "[!] Высокая задержка до домашнего роутера ({0:F1} ms). Если используется Wi-Fi, рекомендуется подключить кабель Ethernet." -f $hop1Avg
         Write-Host $vWifi -ForegroundColor Yellow
         $VerdictLines.Add($vWifi)
     }
@@ -271,7 +304,6 @@ if (Test-Path $DesktopPath) {
     Write-Host ""
     Write-Host "[OK] Диагностика успешно завершена!" -ForegroundColor Green
     Write-Host "Отчёт сохранён на рабочий стол: $DesktopPath" -ForegroundColor Yellow
-    Write-Host "Отправьте этот файл администраторам для анализа проблемы с соединением." -ForegroundColor Cyan
 } else {
     Write-Host ""
     Write-Host "[ERR] Что-то пошло не так при сохранении отчёта." -ForegroundColor Red
