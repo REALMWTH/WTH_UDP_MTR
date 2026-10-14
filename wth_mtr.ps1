@@ -15,7 +15,114 @@ $MtrCycles = 40
 $Timestamp = Get-Date -f 'yyyy-MM-dd_HH-mm-ss'
 $DesktopPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "WTH_Report_$Timestamp.txt"
 
-# 3. Resolve Target IP
+# 3. Compile High-Speed Parallel MTR Engine (Compatible with PS 5.1 and PS 7+)
+if (-not ("WthFastMtr" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+public class HopProbeResult {
+    public int Hop;
+    public bool Success;
+    public string Address;
+    public double RttMs;
+}
+
+public static class WthFastMtr {
+    private static readonly byte[] Payload = new byte[] { 1, 2, 3 };
+    private static readonly Regex PrivateIpRegex = new Regex(
+        @"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.|169\.254\.|198\.18\.)",
+        RegexOptions.Compiled);
+
+    static WthFastMtr() {
+        int minWorker, minIocp;
+        ThreadPool.GetMinThreads(out minWorker, out minIocp);
+        if (minWorker < 64) {
+            ThreadPool.SetMinThreads(64, Math.Max(minIocp, 64));
+        }
+    }
+
+    public static HopProbeResult ProbeSingleHop(string targetIp, int ttl, int timeoutMs) {
+        HopProbeResult fallback = new HopProbeResult { Hop = ttl, Success = false, Address = "???", RttMs = 0.0 };
+        if (timeoutMs <= 0) {
+            return fallback;
+        }
+
+        Task<HopProbeResult> t = Task.Run(() => {
+            HopProbeResult res = new HopProbeResult { Hop = ttl, Success = false, Address = "???", RttMs = 0.0 };
+            try {
+                using (Ping p = new Ping()) {
+                    PingOptions opt = new PingOptions(ttl, true);
+                    Stopwatch sw = Stopwatch.StartNew();
+                    PingReply reply = p.Send(targetIp, timeoutMs, Payload, opt);
+                    sw.Stop();
+                    if (reply != null && (reply.Status == IPStatus.TtlExpired || reply.Status == IPStatus.Success)) {
+                        res.Success = true;
+                        res.Address = reply.Address != null ? reply.Address.ToString() : "???";
+                        res.RttMs = Math.Round(sw.Elapsed.TotalMilliseconds, 1);
+                    }
+                }
+            } catch {}
+            return res;
+        });
+
+        if (t.Wait(timeoutMs + 25)) {
+            return t.Result;
+        }
+        return fallback;
+    }
+
+    public static HopProbeResult[] ProbeHopsParallel(string targetIp, int[] ttls, int[] timeouts) {
+        int n = ttls.Length;
+        Task<HopProbeResult>[] tasks = new Task<HopProbeResult>[n];
+        for (int i = 0; i < n; i++) {
+            int idx = i;
+            tasks[i] = Task.Run(() => ProbeSingleHop(targetIp, ttls[idx], timeouts[idx]));
+        }
+        Task.WaitAll(tasks);
+        HopProbeResult[] results = new HopProbeResult[n];
+        for (int i = 0; i < n; i++) {
+            results[i] = tasks[i].Result;
+        }
+        return results;
+    }
+
+    public static string ResolveFastHostName(string ip, int timeoutMs) {
+        if (string.IsNullOrWhiteSpace(ip) || ip == "???") return "???";
+        if (PrivateIpRegex.IsMatch(ip)) return ip;
+        try {
+            Task<IPHostEntry> t = Dns.GetHostEntryAsync(ip);
+            if (t.Wait(timeoutMs) && t.Result != null && !string.IsNullOrEmpty(t.Result.HostName)) {
+                return t.Result.HostName;
+            }
+        } catch {}
+        return ip;
+    }
+
+    public static string[] ResolveHostsParallel(string[] ips, int timeoutMs) {
+        int n = ips.Length;
+        Task<string>[] tasks = new Task<string>[n];
+        for (int i = 0; i < n; i++) {
+            string currentIp = ips[i];
+            tasks[i] = Task.Run(() => ResolveFastHostName(currentIp, timeoutMs));
+        }
+        Task.WaitAll(tasks);
+        string[] results = new string[n];
+        for (int i = 0; i < n; i++) {
+            results[i] = tasks[i].Result;
+        }
+        return results;
+    }
+}
+"@
+}
+
+# 4. Resolve Target IP
 try {
     $TargetIps = [System.Net.Dns]::GetHostAddresses($Target) | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
     if ($TargetIps.Count -eq 0) {
@@ -39,13 +146,13 @@ Write-Host "   Количество циклов MTR: $MtrCycles пакетов 
 Write-Host "==========================================================" -ForegroundColor Red
 Write-Host ""
 
-# 4. Fetch Public IP
+# 5. Fetch Public IP
 $DateStr = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
 $PublicIpText = "Публичный IP адрес: Не удалось определить"
 try {
-    $UserIP = (curl.exe -s --max-time 4 https://2ip.io).Trim()
+    $UserIP = (curl.exe -s --max-time 3 https://2ip.io).Trim()
     if (-not $UserIP) {
-        $UserIP = (curl.exe -s --max-time 4 https://icanhazip.com).Trim()
+        $UserIP = (curl.exe -s --max-time 3 https://icanhazip.com).Trim()
     }
     if ($UserIP) {
         $PublicIpText = "Публичный IP адрес: $UserIP"
@@ -66,48 +173,46 @@ Write-Host ""
     ""
 ) | Out-File -FilePath $DesktopPath -Encoding utf8
 
-# Helper: Fast Reverse DNS (skip private/CGNAT to prevent timeouts)
-function Get-FastHostName([string]$ip) {
-    if ($ip -eq "???" -or [string]::IsNullOrWhiteSpace($ip)) { return "???" }
-    if ($ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.|169\.254\.|198\.18\.)') {
-        return $ip
-    }
-    try {
-        $task = [System.Net.Dns]::GetHostEntryAsync($ip)
-        if ($task.Wait(300)) {
-            return $task.Result.HostName
-        }
-    } catch {}
-    return $ip
-}
-
 # =========================================================================
-# ОПРЕДЕЛЕНИЕ МАРШРУТА К СЕРВЕРУ
+# ПАРАЛЛЕЛЬНОЕ ОПРЕДЕЛЕНИЕ МАРШРУТА К СЕРВЕРУ (~0.5 СЕК ВМЕСТО 15 СЕК)
 # =========================================================================
-Write-Host "[*] Определение маршрута к серверу (трассировка хопов)..." -ForegroundColor Cyan
+Write-Host "[*] Определение маршрута к серверу (параллельная трассировка хопов)..." -ForegroundColor Cyan
 
-$ping = New-Object System.Net.NetworkInformation.Ping
+$maxHops = 25
+$ttlsToDiscover = 1..$maxHops
+$discoverTimeouts = @(for ($i = 0; $i -lt $maxHops; $i++) { 350 })
+
+# Одновременный опрос всех 25 TTL
+$rawDiscovery = [WthFastMtr]::ProbeHopsParallel($TargetIp, [int[]]$ttlsToDiscover, [int[]]$discoverTimeouts)
+
 $discoveredHops = [System.Collections.Generic.List[PSCustomObject]]::new()
-$payloadBytes = [byte[]]@(1,2,3)
-
-for ($ttl = 1; $ttl -le 25; $ttl++) {
-    $opt = New-Object System.Net.NetworkInformation.PingOptions($ttl, $true)
-    $reply = $ping.Send($TargetIp, 400, $payloadBytes, $opt)
-    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::TtlExpired) {
-        $ipStr = $reply.Address.ToString()
-        $discoveredHops.Add([PSCustomObject]@{ Hop = $ttl; Ip = $ipStr; Host = (Get-FastHostName $ipStr); IsTarget = $false })
-    } elseif ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-        $ipStr = $reply.Address.ToString()
-        $discoveredHops.Add([PSCustomObject]@{ Hop = $ttl; Ip = $ipStr; Host = "${Target}:${TargetPort} [Game Port]"; IsTarget = $true })
-        break
+foreach ($res in $rawDiscovery) {
+    if ($res.Success) {
+        if ($res.Address -eq $TargetIp) {
+            $discoveredHops.Add([PSCustomObject]@{ Hop = $res.Hop; Ip = $res.Address; Host = "${Target}:${TargetPort} [Game Port]"; IsTarget = $true })
+            break
+        } else {
+            $discoveredHops.Add([PSCustomObject]@{ Hop = $res.Hop; Ip = $res.Address; Host = $res.Address; IsTarget = $false })
+        }
     } else {
-        $discoveredHops.Add([PSCustomObject]@{ Hop = $ttl; Ip = "???"; Host = "???"; IsTarget = $false })
+        $discoveredHops.Add([PSCustomObject]@{ Hop = $res.Hop; Ip = "???"; Host = "???"; IsTarget = $false })
     }
 }
 
 # Удаляем хвостовые пустые хопы (???), так как сервер защищен и не отвечает на ICMP Echo
 while ($discoveredHops.Count -gt 0 -and $discoveredHops[$discoveredHops.Count - 1].Ip -eq "???") {
     $discoveredHops.RemoveAt($discoveredHops.Count - 1)
+}
+
+# Параллельный Reverse DNS для всех найденных узлов сразу (~300 мс на все хопы)
+if ($discoveredHops.Count -gt 0) {
+    $ipArray = [string[]]@($discoveredHops | ForEach-Object { $_.Ip })
+    $resolvedHosts = [WthFastMtr]::ResolveHostsParallel($ipArray, 300)
+    for ($i = 0; $i -lt $discoveredHops.Count; $i++) {
+        if (-not $discoveredHops[$i].IsTarget) {
+            $discoveredHops[$i].Host = $resolvedHosts[$i]
+        }
+    }
 }
 
 # Добавляем игровой порт сразу следующим хопом после последнего ответившего узла
@@ -130,17 +235,17 @@ foreach ($h in $discoveredHops) {
 }
 
 Write-Host "[*] Маршрут определен ($($discoveredHops.Count) хопов)." -ForegroundColor Green
-Write-Host "[*] Запуск точных MTR замеров ($MtrCycles циклов по маршруту и игровому порту)..." -ForegroundColor Cyan
+Write-Host "[*] Запуск параллельных MTR замеров ($MtrCycles циклов по маршруту и игровому порту)..." -ForegroundColor Cyan
 
-# Подготовка сокета и полезной нагрузки
+# Подготовка UDP-сокета и полезной нагрузки
 $pingPayload = [System.Text.Encoding]::ASCII.GetBytes("WTH_PING_DIAGNOSTIC_DATA")
 $udp = [System.Net.Sockets.UdpClient]::new()
-$udp.Client.ReceiveTimeout = 800
+$udp.Client.ReceiveTimeout = 350
 try {
     $udp.Connect($TargetIp, $TargetPort)
 } catch {}
 
-# Холостой прогрев UDP-сокета и JIT-компиляции (устраняет ложный скачок Wrst ~50 мс на первом пакете)
+# Холостой прогрев UDP-сокета и JIT-компиляции
 try {
     $null = $udp.Send($pingPayload, $pingPayload.Length)
     $warmupEp = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
@@ -150,55 +255,80 @@ try {
 $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
 $sw = New-Object System.Diagnostics.Stopwatch
 
+# Отделяем список промежуточных ICMP-хопов от финального UDP-хопа
+$icmpHops = @($discoveredHops | Where-Object { -not $_.IsTarget })
+$targetHopObj = $discoveredHops | Where-Object { $_.IsTarget } | Select-Object -First 1
+
 # =========================================================================
-# ЦИКЛ MTR ЗАМЕРОВ
+
+# =========================================================================
+
+# =========================================================================
+# ПАРАЛЛЕЛЬНЫЙ ЦИКЛ MTR ЗАМЕРОВ
 # =========================================================================
 for ($c = 1; $c -le $MtrCycles; $c++) {
     $pct = [Math]::Round(($c / $MtrCycles) * 100)
     Write-Host -NoNewline ("`r  [*] Прогресс MTR: {0}% ({1}/{2})" -f $pct, $c, $MtrCycles)
-    
-    foreach ($h in $discoveredHops) {
+
+    # 1. Подготовка массивов TTL и таймаутов для параллельного ICMP-залпа
+    $ttls = [int[]]::new($icmpHops.Count)
+    $timeouts = [int[]]::new($icmpHops.Count)
+
+    for ($i = 0; $i -lt $icmpHops.Count; $i++) {
+        $h = $icmpHops[$i]
         $st = $hopStats[$h.Hop]
         $st.Sent++
-        
-        if ($st.IsTarget) {
-            # Очистка буфера от запоздавших пакетов прошлых циклов
-            while ($udp.Available -gt 0) {
-                try { $null = $udp.Receive([ref]$ep) } catch { break }
-            }
-            
-            $sw.Restart()
-            try {
-                $null = $udp.Send($pingPayload, $pingPayload.Length)
-                $resp = $udp.Receive([ref]$ep)
-                $sw.Stop()
-                if ($resp.Length -ge 8 -and [System.Text.Encoding]::ASCII.GetString($resp[0..7]) -eq "WTH_PING") {
-                    $st.Recv++
-                    $st.Rtts.Add([Math]::Round($sw.Elapsed.TotalMilliseconds, 1))
-                }
-            } catch {
-                $sw.Stop()
-            }
+        $ttls[$i] = $h.Hop
+
+        # Если узел ??? не ответил ни при трассировке, ни в первых 3 циклах — это глухой роутер, пропускаем ожидание (0 мс)
+        if ($st.IP -eq "???" -and $st.Sent -gt 3 -and $st.Recv -eq 0) {
+            $timeouts[$i] = 0
+        } elseif ($st.IP -eq "???") {
+            $timeouts[$i] = 100
         } else {
-            $opt = New-Object System.Net.NetworkInformation.PingOptions($h.Hop, $true)
-            # Для скрытых узлов (???) короткий таймаут 120 мс, для живых узлов 400 мс
-            $timeout = if ($st.IP -eq "???") { 120 } else { 400 }
-            
-            $sw.Restart()
-            $reply = $ping.Send($TargetIp, $timeout, $payloadBytes, $opt)
-            $sw.Stop()
-            
-            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::TtlExpired -or $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            $timeouts[$i] = 250
+        }
+    }
+
+    # 2. Параллельный ICMP-залп по всем промежуточным узлам (C# ThreadPool, 20-50 мс)
+    if ($icmpHops.Count -gt 0) {
+        $icmpResults = [WthFastMtr]::ProbeHopsParallel($TargetIp, $ttls, $timeouts)
+        foreach ($res in $icmpResults) {
+            if ($res.Success) {
+                $st = $hopStats[$res.Hop]
                 $st.Recv++
-                $st.Rtts.Add([Math]::Round($sw.Elapsed.TotalMilliseconds, 1))
-                if ($st.IP -eq "???") {
-                    $st.IP = $reply.Address.ToString()
-                    $st.Host = Get-FastHostName $st.IP
+                $st.Rtts.Add($res.RttMs)
+                if ($st.IP -eq "???" -and $res.Address -ne "???") {
+                    $st.IP = $res.Address
+                    $st.Host = [WthFastMtr]::ResolveFastHostName($st.IP, 200)
                 }
             }
         }
     }
-    Start-Sleep -Milliseconds 25
+
+    # 3. Опрос игрового UDP-порта сервера
+    if ($null -ne $targetHopObj) {
+        $tStat = $hopStats[$targetHopObj.Hop]
+        $tStat.Sent++
+
+        while ($udp.Available -gt 0) {
+            try { $null = $udp.Receive([ref]$ep) } catch { break }
+        }
+
+        $sw.Restart()
+        try {
+            $null = $udp.Send($pingPayload, $pingPayload.Length)
+            $resp = $udp.Receive([ref]$ep)
+            $sw.Stop()
+            if ($resp.Length -ge 8 -and [System.Text.Encoding]::ASCII.GetString($resp[0..7]) -eq "WTH_PING") {
+                $tStat.Recv++
+                $tStat.Rtts.Add([Math]::Round($sw.Elapsed.TotalMilliseconds, 1))
+            }
+        } catch {
+            $sw.Stop()
+        }
+    }
+    Start-Sleep -Milliseconds 20
 }
 
 $udp.Close()
@@ -304,6 +434,7 @@ if (Test-Path $DesktopPath) {
     Write-Host ""
     Write-Host "[OK] Диагностика успешно завершена!" -ForegroundColor Green
     Write-Host "Отчёт сохранён на рабочий стол: $DesktopPath" -ForegroundColor Yellow
+    Write-Host "Отправьте этот файл администратору или прикрепите в тикет." -ForegroundColor Cyan
 } else {
     Write-Host ""
     Write-Host "[ERR] Что-то пошло не так при сохранении отчёта." -ForegroundColor Red
